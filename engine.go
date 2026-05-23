@@ -122,3 +122,21 @@ func (pe *PolicyEngine) RemovePolicy(subject []byte, action, resource string) er
 	pe.db.CommitTxn(txn)
 	return err
 }
+
+
+// PolicyDisplay is used to send formatted policy data to the UI templates
+type PolicyDisplay struct {
+	Resource string
+	Action   string
+	Effect   string
+}
+
+// GetPolicies retrieves a list of policies bound to a subject.
+// Note: In a production KV store, this requires a prefix scanner over "policy:subjectHex:*"
+func (pe *PolicyEngine) GetPolicies(subject []byte) []PolicyDisplay {
+	// Stub returning a placeholder until DB iteration is implemented
+	return []PolicyDisplay{
+		{Resource: "admin_dashboard", Action: "access", Effect: "ALLOW"},
+		{Resource: "audit_logs", Action: "read", Effect: "ALLOW"},
+	}
+}
