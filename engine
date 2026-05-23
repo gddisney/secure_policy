@@ -11,7 +11,7 @@ const PolicyPageID = ultimate_db.PageID(5)
 
 type Policy struct {
 	Effect     string            `json:"effect"`     // "ALLOW" or "DENY"
-	Conditions map[string]string `json:"conditions"` // Attribute constraints (e.g., "ip": "10.0.0.1")
+	Conditions map[string]string `json:"conditions"` // Attribute constraints
 }
 
 type PolicyEngine struct {
@@ -22,50 +22,46 @@ func NewPolicyEngine(db *ultimate_db.DB) *PolicyEngine {
 	return &PolicyEngine{db: db}
 }
 
-// Evaluate performs the ABAC check.
-// subject: Signer Key (identity)
-// action: Operation (e.g., "read", "ingest")
-// resource: Object (e.g., "logs_db")
-// context: Map of current runtime attributes (e.g., IP address, session ID, service name)
-func (pe *PolicyEngine) Evaluate(subject []byte, action, resource string, context map[string]string) bool {
-	subjectHex := hex.EncodeToString(subject)
-
-	// We check for specific matches AND wildcards to allow policy inheritance
-	// Key: policy:<subject>:<action>:<resource>
-	potentialKeys := []string{
-		fmt.Sprintf("policy:%s:%s:%s", subjectHex, action, resource),
-		fmt.Sprintf("policy:%s:%s:*", subjectHex, action), // Action-level wildcard
-		fmt.Sprintf("policy:%s:*:*", subjectHex),           // Subject-level wildcard
-	}
-
+// 1. PBAC LAYER: Explicit Permission Check
+// Fast O(1) lookup. Does the subject have this permission?
+func (pe *PolicyEngine) HasPermission(subject []byte, permission string) bool {
+	key := []byte(fmt.Sprintf("perm:%s:%s", hex.EncodeToString(subject), permission))
 	txn := pe.db.BeginTxn()
-	defer pe.db.CommitTxn(txn)
-
-	for _, k := range potentialKeys {
-		data, err := pe.db.Read(PolicyPageID, txn, []byte(k))
-		if err != nil {
-			continue // Keep searching wildcards
-		}
-
-		var p Policy
-		if err := json.Unmarshal(data, &p); err != nil {
-			continue
-		}
-
-		// If policy matches, evaluate conditions
-		if p.Effect == "ALLOW" && pe.checkConditions(p.Conditions, context) {
-			return true
-		}
-	}
-
-	return false // Default DENY
+	_, err := pe.db.Read(PolicyPageID, txn, key)
+	return err == nil // If key exists, they have the permission
 }
 
-// checkConditions compares policy requirements against actual runtime context.
+// 2. ABAC LAYER: Attribute Evaluation
+// Slower, logic-heavy lookup for dynamic context.
+func (pe *PolicyEngine) Evaluate(subject []byte, action, resource string, context map[string]string) bool {
+	// --- STAGE 1: PBAC check (Fast Path) ---
+	// If the user has an explicit permission for this action, allow immediately.
+	if pe.HasPermission(subject, action) {
+		return true
+	}
+
+	// --- STAGE 2: ABAC check (Fallback Path) ---
+	subjectHex := hex.EncodeToString(subject)
+	key := []byte(fmt.Sprintf("policy:%s:%s:%s", subjectHex, action, resource))
+	
+	txn := pe.db.BeginTxn()
+	data, err := pe.db.Read(PolicyPageID, txn, key)
+	if err != nil {
+		return false // Default DENY
+	}
+
+	var p Policy
+	if err := json.Unmarshal(data, &p); err != nil {
+		return false
+	}
+
+	return p.Effect == "ALLOW" && pe.checkConditions(p.Conditions, context)
+}
+
 func (pe *PolicyEngine) checkConditions(required map[string]string, actual map[string]string) bool {
 	for k, v := range required {
 		if val, ok := actual[k]; !ok || val != v {
-			return false // Attribute mismatch or missing
+			return false
 		}
 	}
 	return true
@@ -73,22 +69,10 @@ func (pe *PolicyEngine) checkConditions(required map[string]string, actual map[s
 
 // --- Management API ---
 
-func (pe *PolicyEngine) AddPolicy(subject []byte, action, resource, effect string, conditions map[string]string) error {
-	key := []byte(fmt.Sprintf("policy:%s:%s:%s", hex.EncodeToString(subject), action, resource))
-	policy := Policy{Effect: effect, Conditions: conditions}
-	data, _ := json.Marshal(policy)
-
+func (pe *PolicyEngine) GrantPermission(subject []byte, permission string) error {
+	key := []byte(fmt.Sprintf("perm:%s:%s", hex.EncodeToString(subject), permission))
 	txn := pe.db.BeginTxn()
-	err := pe.db.Write(PolicyPageID, txn, key, data, 0)
-	pe.db.CommitTxn(txn)
-	return err
-}
-
-func (pe *PolicyEngine) RemovePolicy(subject []byte, action, resource string) error {
-	key := []byte(fmt.Sprintf("policy:%s:%s:%s", hex.EncodeToString(subject), action, resource))
-	txn := pe.db.BeginTxn()
-	// Assuming DB has a Delete function or similar
-	err := pe.db.Write(PolicyPageID, txn, key, nil, 0) 
+	err := pe.db.Write(PolicyPageID, txn, key, []byte("ok"), 0)
 	pe.db.CommitTxn(txn)
 	return err
 }
