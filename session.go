@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gddisney/ultimate_db"
@@ -35,8 +36,8 @@ func generateJTI() string {
 
 // IssueCookieToken generates a JWT bound to the hardware subject
 func (sm *SessionManager) IssueCookieToken(subject []byte, ttl time.Duration) (string, string, error) {
-	// FIX: Store the RAW username in the JWT, do not hash it here
-	subjectID := string(subject) 
+	// Store the RAW username in the JWT, do not hash it here
+	subjectID := string(subject)
 	jti := generateJTI()
 	now := time.Now()
 
@@ -58,8 +59,7 @@ func (sm *SessionManager) IssueCookieToken(subject []byte, ttl time.Duration) (s
 
 // ValidateCookieToken checks signature, expiration, and the DB blacklist
 func (sm *SessionManager) ValidateCookieToken(tokenString string) (string, error) {
-	// FIX: Transparently strip the legacy prefix before parsing the JWT
-	import "strings" // Ensure this is in your imports at the top of session.go
+	// Transparently strip the legacy prefix before parsing the JWT
 	tokenString = strings.TrimPrefix(tokenString, "user_session_")
 
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
@@ -85,7 +85,7 @@ func (sm *SessionManager) ValidateCookieToken(tokenString string) (string, error
 	txn := sm.db.BeginTxn()
 	defer sm.db.CommitTxn(txn)
 
-	// FIX: Hash the raw username specifically for the database lookup
+	// Hash the raw username specifically for the database lookup
 	hashedSub := hashSubject([]byte(subjectID))
 
 	// 1. Check Global Device Kill Switch
@@ -101,12 +101,12 @@ func (sm *SessionManager) ValidateCookieToken(tokenString string) (string, error
 	}
 
 	// Returns raw username so pe.Evaluate can hash it correctly
-	return subjectID, nil 
+	return subjectID, nil
 }
 
 // RevokeTokenString parses an unverified token to extract the JTI and revokes it.
 func (sm *SessionManager) RevokeTokenString(tokenString string) error {
-	// FIX: Strip the prefix here too
+	// Strip the prefix here too
 	tokenString = strings.TrimPrefix(tokenString, "user_session_")
 
 	token, _, err := new(jwt.Parser).ParseUnverified(tokenString, jwt.MapClaims{})
@@ -120,4 +120,23 @@ func (sm *SessionManager) RevokeTokenString(tokenString string) error {
 		}
 	}
 	return errors.New("could not extract JTI from token")
+}
+
+// RevokeSession invalidates a specific JWT immediately
+func (sm *SessionManager) RevokeSession(jti string, expiry time.Duration) error {
+	txn := sm.db.BeginTxn()
+	// The blacklist entry only needs to live until the JWT naturally expires
+	err := sm.db.Write(SessionPageID, txn, []byte("blacklist:jti:"+jti), []byte("revoked"), expiry)
+	sm.db.CommitTxn(txn)
+	return err
+}
+
+// RevokeDevice permanently blacklists the hardware identity across all active sessions
+func (sm *SessionManager) RevokeDevice(subject []byte) error {
+	subjectID := hashSubject(subject)
+	txn := sm.db.BeginTxn()
+	// Write a permanent blacklist marker (0 TTL)
+	err := sm.db.Write(SessionPageID, txn, []byte("blacklist:device:"+subjectID), []byte("revoked"), 0)
+	sm.db.CommitTxn(txn)
+	return err
 }
