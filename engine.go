@@ -30,8 +30,9 @@ func hashSubject(subject []byte) string {
 	return hex.EncodeToString(h[:])
 }
 
+
 // isRevoked checks the global kill switch for a cryptographic identity
-func (pe *PolicyEngine) isRevoked(txn interface{}, subjectID string) bool {
+func (pe *PolicyEngine) isRevoked(txn uint64, subjectID string) bool {
 	key := []byte("blacklist:device:" + subjectID)
 	data, err := pe.db.Read(PolicyPageID, txn, key)
 	// If the key exists and has data, the device is blacklisted
