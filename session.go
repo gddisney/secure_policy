@@ -113,3 +113,21 @@ func (sm *SessionManager) RevokeDevice(subject []byte) error {
 	sm.db.CommitTxn(txn)
 	return err
 }
+// Add this to session.go
+
+// RevokeTokenString parses an unverified token to extract the JTI and revokes it.
+// This is safe because we only use it to add to a blacklist, not to grant access.
+func (sm *SessionManager) RevokeTokenString(tokenString string) error {
+	token, _, err := new(jwt.Parser).ParseUnverified(tokenString, jwt.MapClaims{})
+	if err != nil {
+		return err
+	}
+
+	if claims, ok := token.Claims.(jwt.MapClaims); ok {
+		if jti, ok := claims["jti"].(string); ok {
+			// Blacklist for 24 hours (or match your max token TTL)
+			return sm.RevokeSession(jti, 24*time.Hour)
+		}
+	}
+	return errors.New("could not extract JTI from token")
+}
