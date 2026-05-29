@@ -13,6 +13,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
+// SessionPageID is strictly reserved for JTI short-term token blacklists
 const SessionPageID = ultimate_db.PageID(6)
 
 type SessionManager struct {
@@ -30,13 +31,12 @@ func NewSessionManager(db *ultimate_db.DB, key *rsa.PrivateKey) *SessionManager 
 // GenerateJTI creates a cryptographically secure unique token ID for revocation tracking
 func generateJTI() string {
 	b := make([]byte, 16)
-	rand.Read(b)
+	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
 
 // IssueCookieToken generates a JWT bound to the hardware subject
 func (sm *SessionManager) IssueCookieToken(subject []byte, ttl time.Duration) (string, string, error) {
-	// Store the RAW username in the JWT, do not hash it here
 	subjectID := string(subject)
 	jti := generateJTI()
 	now := time.Now()
@@ -57,9 +57,8 @@ func (sm *SessionManager) IssueCookieToken(subject []byte, ttl time.Duration) (s
 	return signedToken, jti, nil
 }
 
-// ValidateCookieToken checks signature, expiration, and the DB blacklist
+// ValidateCookieToken checks signature, expiration, and the dual-tier cache/DB blacklists
 func (sm *SessionManager) ValidateCookieToken(tokenString string) (string, error) {
-	// Transparently strip the legacy prefix before parsing the JWT
 	tokenString = strings.TrimPrefix(tokenString, "user_session_")
 
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
@@ -78,35 +77,49 @@ func (sm *SessionManager) ValidateCookieToken(tokenString string) (string, error
 		return "", errors.New("invalid token claims")
 	}
 
-	// This is now the RAW username
 	subjectID := claims["sub"].(string)
 	jti := claims["jti"].(string)
 
-	txn := sm.db.BeginTxn()
-	defer sm.db.CommitTxn(txn)
-
-	// Hash the raw username specifically for the database lookup
 	hashedSub := hashSubject([]byte(subjectID))
+	deviceKillKey := "blacklist:device:" + hashedSub
+	sessionKillKey := "blacklist:jti:" + jti
 
-	// 1. Check Global Device Kill Switch
-	deviceKillKey := []byte("blacklist:device:" + hashedSub)
-	if data, _ := sm.db.Read(SessionPageID, txn, deviceKillKey); len(data) > 0 {
+	txID := ultimate_db.GlobalCacheStore.BeginOCC()
+
+	// --- 1. EVALUATE GLOBAL DEVICE KILL SWITCH (Cache-First) ---
+	devData, err := ultimate_db.GlobalCacheStore.Read(txID, deviceKillKey)
+	if err != nil {
+		// Fall back to PolicyPageID (5) where global revocations live
+		txn := sm.db.BeginTxn()
+		devData, err = sm.db.Read(PolicyPageID, txn, []byte(deviceKillKey))
+		sm.db.CommitTxn(txn)
+		if err == nil && len(devData) > 0 {
+			_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{deviceKillKey: devData}, 0)
+		}
+	}
+	if len(devData) > 0 {
 		return "", errors.New("device identity has been revoked")
 	}
 
-	// 2. Check Specific Session Kill Switch
-	sessionKillKey := []byte("blacklist:jti:" + jti)
-	if data, _ := sm.db.Read(SessionPageID, txn, sessionKillKey); len(data) > 0 {
+	// --- 2. EVALUATE SPECIFIC SESSION KILL SWITCH (Cache-First) ---
+	sessData, err := ultimate_db.GlobalCacheStore.Read(txID, sessionKillKey)
+	if err != nil {
+		txn := sm.db.BeginTxn()
+		sessData, err = sm.db.Read(SessionPageID, txn, []byte(sessionKillKey))
+		sm.db.CommitTxn(txn)
+		if err == nil && len(sessData) > 0 {
+			_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{sessionKillKey: sessData}, 0)
+		}
+	}
+	if len(sessData) > 0 {
 		return "", errors.New("session has been revoked")
 	}
 
-	// Returns raw username so pe.Evaluate can hash it correctly
 	return subjectID, nil
 }
 
 // RevokeTokenString parses an unverified token to extract the JTI and revokes it.
 func (sm *SessionManager) RevokeTokenString(tokenString string) error {
-	// Strip the prefix here too
 	tokenString = strings.TrimPrefix(tokenString, "user_session_")
 
 	token, _, err := new(jwt.Parser).ParseUnverified(tokenString, jwt.MapClaims{})
@@ -122,21 +135,39 @@ func (sm *SessionManager) RevokeTokenString(tokenString string) error {
 	return errors.New("could not extract JTI from token")
 }
 
-// RevokeSession invalidates a specific JWT immediately
+// RevokeSession invalidates a specific JWT session token immediately across memory and disk
 func (sm *SessionManager) RevokeSession(jti string, expiry time.Duration) error {
+	compositeKey := "blacklist:jti:" + jti
+	marker := []byte("revoked")
+
+	// 1. Evict instantly from the fast cache layer to sever active sessions within microseconds
+	txID := ultimate_db.GlobalCacheStore.BeginOCC()
+	if err := ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: marker}, expiry); err != nil {
+		return fmt.Errorf("session cache revocation abort: %w", err)
+	}
+
+	// 2. Persist to storage page blocks for durability
 	txn := sm.db.BeginTxn()
-	// The blacklist entry only needs to live until the JWT naturally expires
-	err := sm.db.Write(SessionPageID, txn, []byte("blacklist:jti:"+jti), []byte("revoked"), expiry)
+	err := sm.db.Write(SessionPageID, txn, []byte(compositeKey), marker, expiry)
 	sm.db.CommitTxn(txn)
 	return err
 }
 
-// RevokeDevice permanently blacklists the hardware identity across all active sessions
+// RevokeDevice permanently blacklists the hardware identity globally across page structures
 func (sm *SessionManager) RevokeDevice(subject []byte) error {
-	subjectID := hashSubject(subject)
+	hashedSub := hashSubject(subject)
+	compositeKey := "blacklist:device:" + hashedSub
+	marker := []byte("revoked")
+
+	// 1. Evict globally from memory
+	txID := ultimate_db.GlobalCacheStore.BeginOCC()
+	if err := ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: marker}, 0); err != nil {
+		return fmt.Errorf("device cache revocation abort: %w", err)
+	}
+
+	// 2. Write to PolicyPageID (5) to align with secure_policy validation vectors
 	txn := sm.db.BeginTxn()
-	// Write a permanent blacklist marker (0 TTL)
-	err := sm.db.Write(SessionPageID, txn, []byte("blacklist:device:"+subjectID), []byte("revoked"), 0)
+	err := sm.db.Write(PolicyPageID, txn, []byte(compositeKey), marker, 0)
 	sm.db.CommitTxn(txn)
 	return err
 }
