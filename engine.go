@@ -30,53 +30,80 @@ func hashSubject(subject []byte) string {
 	return hex.EncodeToString(h[:])
 }
 
-// isRevoked checks the global kill switch for a cryptographic identity
-// FIXED: txn type is uint64
-func (pe *PolicyEngine) isRevoked(txn uint64, subjectID string) bool {
-	key := []byte("blacklist:device:" + subjectID)
-	data, err := pe.db.Read(PolicyPageID, txn, key)
-	// If the key exists and has data, the device is blacklisted
-	return err == nil && len(data) > 0
-}
+// isRevoked leverages non-blocking snapshot reads across our lock-free memory cache layer
+func (pe *PolicyEngine) isRevoked(txID uint64, txn uint64, subjectID string) bool {
+	compositeKey := "blacklist:device:" + subjectID
 
-// 1. PBAC LAYER: Explicit Permission Check
-func (pe *PolicyEngine) HasPermission(subject []byte, permission string) bool {
-	subjectID := hashSubject(subject)
-	
-	txn := pe.db.BeginTxn()
-	defer pe.db.CommitTxn(txn)
-
-	// SECURITY: Hard fail if the identity is revoked
-	if pe.isRevoked(txn, subjectID) {
-		return false
+	// 1. Check MVCC Lock-Free Fast Cache
+	data, err := ultimate_db.GlobalCacheStore.Read(txID, compositeKey)
+	if err == nil {
+		return len(data) > 0
 	}
 
-	key := []byte(fmt.Sprintf("perm:%s:%s", subjectID, permission))
-	data, err := pe.db.Read(PolicyPageID, txn, key)
-	
-	// Ensure the key exists and isn't a tombstone
-	return err == nil && len(data) > 0
-}
-
-// 2. ABAC LAYER: Attribute Evaluation
-func (pe *PolicyEngine) Evaluate(subject []byte, action, resource string, context map[string]string) bool {
-	subjectID := hashSubject(subject)
-
-	txn := pe.db.BeginTxn()
-	defer pe.db.CommitTxn(txn) 
-
-	// SECURITY: Hard fail if the identity is revoked
-	if pe.isRevoked(txn, subjectID) {
-		return false
-	}
-
-	// --- STAGE 1: PBAC check (Fast Path) ---
-	permKey := []byte(fmt.Sprintf("perm:%s:%s", subjectID, action))
-	if permData, err := pe.db.Read(PolicyPageID, txn, permKey); err == nil && len(permData) > 0 {
+	// 2. Fall back to slotted storage frame on cache miss
+	data, err = pe.db.Read(PolicyPageID, txn, []byte(compositeKey))
+	if err == nil && len(data) > 0 {
+		// Repopulate cache frame to accelerate subsequent access assertions
+		_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: data}, 0)
 		return true
 	}
 
-	// --- STAGE 2: ABAC check (Fallback Path) ---
+	return false
+}
+
+// HasPermission executes an explicit permission lookup path optimized for real-time mesh routing loops
+func (pe *PolicyEngine) HasPermission(subject []byte, permission string) bool {
+	subjectID := hashSubject(subject)
+	
+	txID := ultimate_db.GlobalCacheStore.BeginOCC()
+	txn := pe.db.BeginTxn()
+	defer pe.db.CommitTxn(txn)
+
+	if pe.isRevoked(txID, txn, subjectID) {
+		return false
+	}
+
+	compositeKey := fmt.Sprintf("perm:%s:%s", subjectID, permission)
+
+	// Attempt reading directly from MVCC Lock-Free Cache first
+	data, err := ultimate_db.GlobalCacheStore.Read(txID, compositeKey)
+	if err == nil {
+		return len(data) > 0
+	}
+
+	// Fallback to Slotted Page Durability Store on cache miss
+	data, err = pe.db.Read(PolicyPageID, txn, []byte(compositeKey))
+	if err == nil && len(data) > 0 {
+		_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: data}, 0)
+		return true
+	}
+
+	return false
+}
+
+// Evaluate runs a dual-stage PBAC/ABAC check with strict Deny-Override over unified transactional layers
+func (pe *PolicyEngine) Evaluate(subject []byte, action, resource string, context map[string]string) bool {
+	subjectID := hashSubject(subject)
+
+	txID := ultimate_db.GlobalCacheStore.BeginOCC()
+	txn := pe.db.BeginTxn()
+	defer pe.db.CommitTxn(txn) 
+
+	if pe.isRevoked(txID, txn, subjectID) {
+		return false
+	}
+
+	// --- STAGE 1: PBAC check (Fast Cache Resolution Path) ---
+	permKey := fmt.Sprintf("perm:%s:%s", subjectID, action)
+	if permData, err := ultimate_db.GlobalCacheStore.Read(txID, permKey); err == nil && len(permData) > 0 {
+		return true
+	}
+	if permData, err := pe.db.Read(PolicyPageID, txn, []byte(permKey)); err == nil && len(permData) > 0 {
+		_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{permKey: permData}, 0)
+		return true
+	}
+
+	// --- STAGE 2: ABAC check (Fallback Chunk Hierarchy Path) ---
 	potentialKeys := []string{
 		fmt.Sprintf("policy:%s:%s:%s", subjectID, action, resource),
 		fmt.Sprintf("policy:%s:%s:*", subjectID, action),
@@ -86,28 +113,36 @@ func (pe *PolicyEngine) Evaluate(subject []byte, action, resource string, contex
 	isAllowed := false
 
 	for _, k := range potentialKeys {
-		data, err := pe.db.Read(PolicyPageID, txn, []byte(k))
-		
-		// Ignore not found errors or empty tombstone data
-		if err != nil || len(data) == 0 {
+		var data []byte
+		var err error
+
+		// Leverage lock-free memory space for policy evaluation matrix
+		data, err = ultimate_db.GlobalCacheStore.Read(txID, k)
+		if err != nil {
+			data, err = pe.db.Read(PolicyPageID, txn, []byte(k))
+			if err != nil || len(data) == 0 {
+				continue
+			}
+			_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{k: data}, 0)
+		}
+
+		if len(data) == 0 {
 			continue 
 		}
 
 		var p Policy
 		if err := json.Unmarshal(data, &p); err != nil {
-			continue // Skip malformed policies
+			continue 
 		}
 
 		if pe.checkConditions(p.Conditions, context) {
 			// SECURITY: Strict Deny-Override
-			// If ANY matching policy evaluates to DENY, reject immediately.
 			if p.Effect == "DENY" {
 				return false
 			}
 			
 			if p.Effect == "ALLOW" {
 				isAllowed = true
-				// Do not return true immediately; continue loop to ensure no broader DENY exists
 			}
 		}
 	}
@@ -130,39 +165,57 @@ func (pe *PolicyEngine) checkConditions(required map[string]string, actual map[s
 
 func (pe *PolicyEngine) RevokeSubject(subject []byte) error {
 	subjectID := hashSubject(subject)
-	key := []byte("blacklist:device:" + subjectID)
-	
+	compositeKey := "blacklist:device:" + subjectID
+	marker := []byte("revoked")
+
+	// 1. Evict instantly from the high-speed cache ring to break active sessions within microseconds
+	txID := ultimate_db.GlobalCacheStore.BeginOCC()
+	if err := ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: marker}, 0); err != nil {
+		return fmt.Errorf("cache eviction phase interrupted: %w", err)
+	}
+
+	// 2. Commit permanently to durable slotted page layouts
 	txn := pe.db.BeginTxn()
-	// Write a permanent blacklist marker (TTL 0)
-	err := pe.db.Write(PolicyPageID, txn, key, []byte("revoked"), 0)
+	err := pe.db.Write(PolicyPageID, txn, []byte(compositeKey), marker, 0)
 	pe.db.CommitTxn(txn)
 	return err
 }
 
 func (pe *PolicyEngine) RestoreSubject(subject []byte) error {
 	subjectID := hashSubject(subject)
-	key := []byte("blacklist:device:" + subjectID)
-	
+	compositeKey := "blacklist:device:" + subjectID
+
+	// Clear tombstone values straight through the cache layer
+	txID := ultimate_db.GlobalCacheStore.BeginOCC()
+	if err := ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: nil}, 0); err != nil {
+		return fmt.Errorf("cache extraction failed: %w", err)
+	}
+
 	txn := pe.db.BeginTxn()
-	// Write tombstone to remove blacklist
-	err := pe.db.Write(PolicyPageID, txn, key, []byte{}, 0)
+	err := pe.db.Write(PolicyPageID, txn, []byte(compositeKey), []byte{}, 0)
 	pe.db.CommitTxn(txn)
 	return err
 }
 
 func (pe *PolicyEngine) GrantPermission(subject []byte, permission string) error {
 	subjectID := hashSubject(subject)
-	key := []byte(fmt.Sprintf("perm:%s:%s", subjectID, permission))
-	
+	compositeKey := fmt.Sprintf("perm:%s:%s", subjectID, permission)
+	val := []byte("ok")
+
+	txID := ultimate_db.GlobalCacheStore.BeginOCC()
+	if err := ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: val}, 0); err != nil {
+		return err
+	}
+
 	txn := pe.db.BeginTxn()
-	err := pe.db.Write(PolicyPageID, txn, key, []byte("ok"), 0)
+	err := pe.db.Write(PolicyPageID, txn, []byte(compositeKey), val, 0)
 	pe.db.CommitTxn(txn)
 	return err
 }
 
 func (pe *PolicyEngine) AddPolicy(subject []byte, action, resource, effect string, conditions map[string]string) error {
 	subjectID := hashSubject(subject)
-	key := []byte(fmt.Sprintf("policy:%s:%s:%s", subjectID, action, resource))
+	compositeKey := fmt.Sprintf("policy:%s:%s:%s", subjectID, action, resource)
 	
 	policy := Policy{Effect: effect, Conditions: conditions}
 	data, err := json.Marshal(policy)
@@ -170,19 +223,28 @@ func (pe *PolicyEngine) AddPolicy(subject []byte, action, resource, effect strin
 		return fmt.Errorf("failed to marshal policy: %w", err)
 	}
 
+	txID := ultimate_db.GlobalCacheStore.BeginOCC()
+	if err := ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: data}, 0); err != nil {
+		return err
+	}
+
 	txn := pe.db.BeginTxn()
-	err = pe.db.Write(PolicyPageID, txn, key, data, 0)
+	err = pe.db.Write(PolicyPageID, txn, []byte(compositeKey), data, 0)
 	pe.db.CommitTxn(txn)
 	return err
 }
 
 func (pe *PolicyEngine) RemovePolicy(subject []byte, action, resource string) error {
 	subjectID := hashSubject(subject)
-	key := []byte(fmt.Sprintf("policy:%s:%s:%s", subjectID, action, resource))
+	compositeKey := fmt.Sprintf("policy:%s:%s:%s", subjectID, action, resource)
 	
+	txID := ultimate_db.GlobalCacheStore.BeginOCC()
+	if err := ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: nil}, 0); err != nil {
+		return err
+	}
+
 	txn := pe.db.BeginTxn()
-	// Overwrite with empty byte slice to act as a tombstone
-	err := pe.db.Write(PolicyPageID, txn, key, []byte{}, 0) 
+	err := pe.db.Write(PolicyPageID, txn, []byte(compositeKey), []byte{}, 0) 
 	pe.db.CommitTxn(txn)
 	return err
 }
