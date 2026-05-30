@@ -1,173 +1,277 @@
 package secure_policy
 
 import (
-	"crypto/rand"
-	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/hex"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/0TrustCloud/ultimate_db"
-	"github.com/golang-jwt/jwt/v5"
 )
 
-// SessionPageID is strictly reserved for JTI short-term token blacklists
-const SessionPageID = ultimate_db.PageID(6)
+const PolicyPageID = ultimate_db.PageID(5)
 
-type SessionManager struct {
-	db         *ultimate_db.DB
-	signingKey *rsa.PrivateKey
+type Policy struct {
+	Effect     string            `json:"effect"`     // "ALLOW" or "DENY"
+	Conditions map[string]string `json:"conditions"` // Advanced attribute matching constraints
 }
 
-func NewSessionManager(db *ultimate_db.DB, key *rsa.PrivateKey) *SessionManager {
-	return &SessionManager{
-		db:         db,
-		signingKey: key,
-	}
+type PolicyEngine struct {
+	db *ultimate_db.DB
 }
 
-// GenerateJTI creates a cryptographically secure unique token ID for revocation tracking
-func generateJTI() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+func NewPolicyEngine(db *ultimate_db.DB) *PolicyEngine {
+	return &PolicyEngine{db: db}
 }
 
-// IssueCookieToken generates a JWT bound to the hardware subject
-func (sm *SessionManager) IssueCookieToken(subject []byte, ttl time.Duration) (string, string, error) {
-	subjectID := string(subject)
-	jti := generateJTI()
-	now := time.Now()
-
-	claims := jwt.MapClaims{
-		"sub": subjectID,
-		"jti": jti,
-		"iat": now.Unix(),
-		"exp": now.Add(ttl).Unix(),
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	signedToken, err := token.SignedString(sm.signingKey)
-	if err != nil {
-		return "", "", err
-	}
-
-	return signedToken, jti, nil
+// hashSubject standardizes the variable-length TPM/Passkey into a fixed-length string
+func hashSubject(subject []byte) string {
+	h := sha256.Sum256(subject)
+	return hex.EncodeToString(h[:])
 }
 
-// ValidateCookieToken checks signature, expiration, and the dual-tier cache/DB blacklists
-func (sm *SessionManager) ValidateCookieToken(tokenString string) (string, error) {
-	tokenString = strings.TrimPrefix(tokenString, "user_session_")
+// isRevoked leverages non-blocking snapshot reads across our lock-free memory cache layer
+func (pe *PolicyEngine) isRevoked(txID uint64, txn uint64, subjectID string) bool {
+	compositeKey := "blacklist:device:" + subjectID
 
-	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
-		return &sm.signingKey.PublicKey, nil
-	})
-
-	if err != nil || !token.Valid {
-		return "", errors.New("invalid or expired token")
+	// 1. Check MVCC Lock-Free Fast Cache
+	data, err := ultimate_db.GlobalCacheStore.Read(txID, compositeKey)
+	if err == nil {
+		return len(data) > 0
 	}
 
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		return "", errors.New("invalid token claims")
+	// 2. Fall back to slotted storage frame on cache miss
+	data, err = pe.db.Read(PolicyPageID, txn, []byte(compositeKey))
+	if err == nil && len(data) > 0 {
+		// Repopulate cache frame to accelerate subsequent access assertions
+		_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: data}, 0)
+		return true
 	}
 
-	subjectID := claims["sub"].(string)
-	jti := claims["jti"].(string)
+	return false
+}
 
-	hashedSub := hashSubject([]byte(subjectID))
-	deviceKillKey := "blacklist:device:" + hashedSub
-	sessionKillKey := "blacklist:jti:" + jti
+// HasPermission executes an explicit permission lookup path optimized for real-time mesh routing loops
+func (pe *PolicyEngine) HasPermission(subject []byte, permission string) bool {
+	subjectID := hashSubject(subject)
+	
+	txID := ultimate_db.GlobalCacheStore.BeginOCC()
+	txn := pe.db.BeginTxn()
+	defer pe.db.CommitTxn(txn)
+
+	if pe.isRevoked(txID, txn, subjectID) {
+		return false
+	}
+
+	compositeKey := fmt.Sprintf("perm:%s:%s", subjectID, permission)
+
+	// Attempt reading directly from MVCC Lock-Free Cache first
+	data, err := ultimate_db.GlobalCacheStore.Read(txID, compositeKey)
+	if err == nil {
+		return len(data) > 0
+	}
+
+	// Fallback to Slotted Page Durability Store on cache miss
+	data, err = pe.db.Read(PolicyPageID, txn, []byte(compositeKey))
+	if err == nil && len(data) > 0 {
+		_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: data}, 0)
+		return true
+	}
+
+	return false
+}
+
+// Evaluate runs a dual-stage PBAC/ABAC check with strict Deny-Override over unified transactional layers
+func (pe *PolicyEngine) Evaluate(subject []byte, action, resource string, context map[string]string) bool {
+	subjectID := hashSubject(subject)
 
 	txID := ultimate_db.GlobalCacheStore.BeginOCC()
+	txn := pe.db.BeginTxn()
+	defer pe.db.CommitTxn(txn) 
 
-	// --- 1. EVALUATE GLOBAL DEVICE KILL SWITCH (Cache-First) ---
-	devData, err := ultimate_db.GlobalCacheStore.Read(txID, deviceKillKey)
-	if err != nil {
-		// Fall back to PolicyPageID (5) where global revocations live
-		txn := sm.db.BeginTxn()
-		devData, err = sm.db.Read(PolicyPageID, txn, []byte(deviceKillKey))
-		sm.db.CommitTxn(txn)
-		if err == nil && len(devData) > 0 {
-			_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{deviceKillKey: devData}, 0)
+	if pe.isRevoked(txID, txn, subjectID) {
+		return false
+	}
+
+	// --- STAGE 1: PBAC check (Fast Cache Resolution Path) ---
+	permKey := fmt.Sprintf("perm:%s:%s", subjectID, action)
+	if permData, err := ultimate_db.GlobalCacheStore.Read(txID, permKey); err == nil && len(permData) > 0 {
+		return true
+	}
+	if permData, err := pe.db.Read(PolicyPageID, txn, []byte(permKey)); err == nil && len(permData) > 0 {
+		_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{permKey: permData}, 0)
+		return true
+	}
+
+	// --- STAGE 2: ABAC check (Fallback Chunk Hierarchy Path) ---
+	potentialKeys := []string{
+		fmt.Sprintf("policy:%s:%s:%s", subjectID, action, resource),
+		fmt.Sprintf("policy:%s:%s:*", subjectID, action),
+		fmt.Sprintf("policy:%s:*:*", subjectID),
+	}
+
+	isAllowed := false
+
+	for _, k := range potentialKeys {
+		var data []byte
+		var err error
+
+		// Leverage lock-free memory space for policy evaluation matrix
+		data, err = ultimate_db.GlobalCacheStore.Read(txID, k)
+		if err != nil {
+			data, err = pe.db.Read(PolicyPageID, txn, []byte(k))
+			if err != nil || len(data) == 0 {
+				continue
+			}
+			_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{k: data}, 0)
+		}
+
+		if len(data) == 0 {
+			continue 
+		}
+
+		var p Policy
+		if err := json.Unmarshal(data, &p); err != nil {
+			continue 
+		}
+
+		if pe.checkConditions(p.Conditions, context) {
+			// SECURITY: Strict Deny-Override
+			if p.Effect == "DENY" {
+				return false
+			}
+			
+			if p.Effect == "ALLOW" {
+				isAllowed = true
+			}
 		}
 	}
-	if len(devData) > 0 {
-		return "", errors.New("device identity has been revoked")
-	}
 
-	// --- 2. EVALUATE SPECIFIC SESSION KILL SWITCH (Cache-First) ---
-	sessData, err := ultimate_db.GlobalCacheStore.Read(txID, sessionKillKey)
-	if err != nil {
-		txn := sm.db.BeginTxn()
-		sessData, err = sm.db.Read(SessionPageID, txn, []byte(sessionKillKey))
-		sm.db.CommitTxn(txn)
-		if err == nil && len(sessData) > 0 {
-			_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{sessionKillKey: sessData}, 0)
-		}
-	}
-	if len(sessData) > 0 {
-		return "", errors.New("session has been revoked")
-	}
-
-	return subjectID, nil
+	return isAllowed 
 }
 
-// RevokeTokenString parses an unverified token to extract the JTI and revokes it.
-func (sm *SessionManager) RevokeTokenString(tokenString string) error {
-	tokenString = strings.TrimPrefix(tokenString, "user_session_")
+// checkConditions operates advanced pattern matching (prefixes, suffixes, exact matching)
+func (pe *PolicyEngine) checkConditions(required map[string]string, actual map[string]string) bool {
+	if len(required) == 0 { return true }
+	if actual == nil { return false }
+	
+	for k, pattern := range required {
+		val, exists := actual[k]
+		if !exists {
+			return false
+		}
 
-	token, _, err := new(jwt.Parser).ParseUnverified(tokenString, jwt.MapClaims{})
-	if err != nil {
-		return err
-	}
+		// Prefix matching check (e.g., prefix:/usr/bin/)
+		if strings.HasPrefix(pattern, "prefix:") {
+			pfx := strings.TrimPrefix(pattern, "prefix:")
+			if !strings.HasPrefix(val, pfx) {
+				return false
+			}
+			continue
+		}
 
-	if claims, ok := token.Claims.(jwt.MapClaims); ok {
-		if jti, ok := claims["jti"].(string); ok {
-			return sm.RevokeSession(jti, 24*time.Hour)
+		// Suffix matching check (e.g., suffix:.sh)
+		if strings.HasPrefix(pattern, "suffix:") {
+			sfx := strings.TrimPrefix(pattern, "suffix:")
+			if !strings.HasSuffix(val, sfx) {
+				return false
+			}
+			continue
+		}
+
+		// Fall back to robust exact matching
+		if val != pattern {
+			return false
 		}
 	}
-	return errors.New("could not extract JTI from token")
+	return true
 }
 
-// RevokeSession invalidates a specific JWT session token immediately across memory and disk
-func (sm *SessionManager) RevokeSession(jti string, expiry time.Duration) error {
-	compositeKey := "blacklist:jti:" + jti
+// --- Management API ---
+
+func (pe *PolicyEngine) RevokeSubject(subject []byte) error {
+	subjectID := hashSubject(subject)
+	compositeKey := "blacklist:device:" + subjectID
 	marker := []byte("revoked")
 
-	// 1. Evict instantly from the fast cache layer to sever active sessions within microseconds
+	// 1. Evict instantly from the high-speed cache ring to break active sessions within microseconds
 	txID := ultimate_db.GlobalCacheStore.BeginOCC()
-	if err := ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: marker}, expiry); err != nil {
-		return fmt.Errorf("session cache revocation abort: %w", err)
+	if err := ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: marker}, 0); err != nil {
+		return fmt.Errorf("cache eviction phase interrupted: %w", err)
 	}
 
-	// 2. Persist to storage page blocks for durability
-	txn := sm.db.BeginTxn()
-	err := sm.db.Write(SessionPageID, txn, []byte(compositeKey), marker, expiry)
-	sm.db.CommitTxn(txn)
+	// 2. Commit permanently to durable slotted page layouts
+	txn := pe.db.BeginTxn()
+	err := pe.db.Write(PolicyPageID, txn, []byte(compositeKey), marker, 0)
+	pe.db.CommitTxn(txn)
 	return err
 }
 
-// RevokeDevice permanently blacklists the hardware identity globally across page structures
-func (sm *SessionManager) RevokeDevice(subject []byte) error {
-	hashedSub := hashSubject(subject)
-	compositeKey := "blacklist:device:" + hashedSub
-	marker := []byte("revoked")
+func (pe *PolicyEngine) RestoreSubject(subject []byte) error {
+	subjectID := hashSubject(subject)
+	compositeKey := "blacklist:device:" + subjectID
 
-	// 1. Evict globally from memory
+	// Clear tombstone values straight through the cache layer
 	txID := ultimate_db.GlobalCacheStore.BeginOCC()
-	if err := ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: marker}, 0); err != nil {
-		return fmt.Errorf("device cache revocation abort: %w", err)
+	if err := ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: nil}, 0); err != nil {
+		return fmt.Errorf("cache extraction failed: %w", err)
 	}
 
-	// 2. Write to PolicyPageID (5) to align with secure_policy validation vectors
-	txn := sm.db.BeginTxn()
-	err := sm.db.Write(PolicyPageID, txn, []byte(compositeKey), marker, 0)
-	sm.db.CommitTxn(txn)
+	txn := pe.db.BeginTxn()
+	err := pe.db.Write(PolicyPageID, txn, []byte(compositeKey), []byte{}, 0)
+	pe.db.CommitTxn(txn)
+	return err
+}
+
+func (pe *PolicyEngine) GrantPermission(subject []byte, permission string) error {
+	subjectID := hashSubject(subject)
+	compositeKey := fmt.Sprintf("perm:%s:%s", subjectID, permission)
+	val := []byte("ok")
+
+	txID := ultimate_db.GlobalCacheStore.BeginOCC()
+	if err := ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: val}, 0); err != nil {
+		return err
+	}
+
+	txn := pe.db.BeginTxn()
+	err := pe.db.Write(PolicyPageID, txn, []byte(compositeKey), val, 0)
+	pe.db.CommitTxn(txn)
+	return err
+}
+
+func (pe *PolicyEngine) AddPolicy(subject []byte, action, resource, effect string, conditions map[string]string) error {
+	subjectID := hashSubject(subject)
+	compositeKey := fmt.Sprintf("policy:%s:%s:%s", subjectID, action, resource)
+	
+	policy := Policy{Effect: effect, Conditions: conditions}
+	data, err := json.Marshal(policy)
+	if err != nil {
+		return fmt.Errorf("failed to marshal policy: %w", err)
+	}
+
+	txID := ultimate_db.GlobalCacheStore.BeginOCC()
+	if err := ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: data}, 0); err != nil {
+		return err
+	}
+
+	txn := pe.db.BeginTxn()
+	err = pe.db.Write(PolicyPageID, txn, []byte(compositeKey), data, 0)
+	pe.db.CommitTxn(txn)
+	return err
+}
+
+func (pe *PolicyEngine) RemovePolicy(subject []byte, action, resource string) error {
+	subjectID := hashSubject(subject)
+	compositeKey := fmt.Sprintf("policy:%s:%s:%s", subjectID, action, resource)
+	
+	txID := ultimate_db.GlobalCacheStore.BeginOCC()
+	if err := ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: nil}, 0); err != nil {
+		return err
+	}
+
+	txn := pe.db.BeginTxn()
+	err := pe.db.Write(PolicyPageID, txn, []byte(compositeKey), []byte{}, 0) 
+	pe.db.CommitTxn(txn)
 	return err
 }
