@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gddisney/ultimate_db"
+	"github.com/0TrustCloud/ultimate_db"
 	"github.com/golang-jwt/jwt/v5"
 )
 
