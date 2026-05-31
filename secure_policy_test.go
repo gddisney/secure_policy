@@ -3,11 +3,10 @@ package secure_policy
 import (
 	"crypto/rand"
 	"crypto/rsa"
-	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
-
+        "strings"
 	"github.com/0TrustCloud/secure_data_format"
 	"github.com/0TrustCloud/ultimate_db"
 )
@@ -78,7 +77,7 @@ func (m *mockLockManager) ReleaseAll(txnID uint64) error {
 }
 
 // Helper to bootstrap a test SDF engine instance
-func setupTestSDFEngine(t *testing.T) (*securedataformat.SecureDataEngine, *mockKVStore, *rsa.PrivateKey) {
+func setupTestSDFEngine(t *testing.T) (*secure_data_format.SecureDataEngine, *mockKVStore, *rsa.PrivateKey) {
 	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatalf("failed generating test key pair: %v", err)
@@ -87,7 +86,7 @@ func setupTestSDFEngine(t *testing.T) (*securedataformat.SecureDataEngine, *mock
 	storeMock := &mockKVStore{records: make(map[string][]byte)}
 	lockMock := &mockLockManager{acquiredLocks: make(map[string]uint64)}
 
-	engine, err := securedataformat.New(storeMock, lockMock, "test-policy-authority", privKey)
+	engine, err := secure_data_format.New(storeMock, lockMock, "test-policy-authority", privKey)
 	if err != nil {
 		t.Fatalf("failed initializing underlying SDF engine: %v", err)
 	}

@@ -17,7 +17,7 @@ func hashSubject(subject []byte) string {
 
 // getNextNonce queries the active SDF storage layer to resolve and increment 
 // the sequential tracking nonce for a specific resource address.
-func getNextNonce(engine *securedataformat.SecureDataEngine, profile string, targetAddress string) uint64 {
+func getNextNonce(engine *secure_data_format.SecureDataEngine, profile string, targetAddress string) uint64 {
 	worldStateKey := fmt.Sprintf("state:%s:%s", profile, targetAddress)
 	txn := engine.Store.Begin()
 	defer txn.Abort()

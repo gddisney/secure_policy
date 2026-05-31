@@ -1,95 +1,142 @@
-# `secure_policy`
-
-`secure_policy` is a high-performance, hybrid Authorization Engine designed for decentralized Go microservices. It implements a two-tier security model combining **PBAC (Permission-Based Access Control)** for rapid decision-making and **ABAC (Attribute-Based Access Control)** for context-aware, granular policy enforcement.
-
-It is built to integrate directly with [ultimate_db](https://www.google.com/search?q=https://github.com/gddisney/ultimate_db), ensuring that security policies are persisted, transactionally consistent, and easily replicated across a peer-to-peer mesh.
-
-## Features
-
-* **Hybrid Security Architecture**:
-* **Fast-Path PBAC**: O(1) lookups for explicit, static permissions.
-* **ABAC Fallback**: Logic-heavy, attribute-based evaluation for dynamic context (e.g., matching IPs, service names, or time-based conditions).
 
 
-* **Default-Deny Posture**: If an error occurs or no policy is found, the engine defaults to `false` (Deny).
-* **Deny-Override Logic**: Explicit `DENY` policies always supersede `ALLOW` policies, ensuring high-security constraints are respected.
-* **Wildcard Support**: Built-in support for subject and action wildcards to simplify administration.
-* **Transactional Integrity**: Leverages `ultimate_db` ACID transactions to ensure policy updates are atomic.
+# Secure Policy Engine (`secure_policy`)
 
-## Usage
+`secure_policy` is a high-performance, zero-trust security enforcement framework designed for distributed mesh networks and edge computing topologies. Engineered in Go, it abstracts and replaces old, slow database queries with a **Polymorphic Cryptographic State Transition** model built natively on top of the **Secure Data Format (SDF)** protocol.
 
-### 1. Initialization
+The architecture decouples business logic from physical storage layout, orchestrating session lifecycles, Role-Based Access Control (RBAC), and Attribute-Based Access Control (ABAC) using strict isolation boundaries.
 
-The engine requires a `*ultimate_db.DB` instance. It maps policies to `PolicyPageID` (5).
+---
+
+## 1. Core Architectural Pillars
+
+* **Dual-Tier State Verification:** Validates access requests through a cache-first hierarchy. It evaluates non-blocking snapshot reads across a lock-free memory ring (`GlobalCacheStore`) before falling back to abstract key-value lookups (`KVStore`).
+* **Cryptographic Immutability:** Every policy mutation, permission grant, or session revocation compiles into an SDF contract. This produces an un-tamperable state receipt tracking nonces and signing envelopes.
+* **Strict Deny-Override:** Implements a fail-closed evaluation matrix. If a subject matches multiple intersecting policies, any explicit `DENY` automatically short-circuits and overrides all matching `ALLOW` assertions.
+* **Advanced Attribute Matching:** ABAC conditions support high-performance pattern evaluations, including exact string comparisons, `prefix:` pathing, and `suffix:` extension matching.
+
+---
+
+## 2. Component Layout
+
+The framework isolates identity management from fine-grained policy evaluation through two core subsystems:
+
+### Policy Engine (`PolicyEngine`)
+
+Handles permission delegation and complex ABAC evaluation loops. It maps authorization matrices into explicit data state blocks and validates live parameters against prefix/suffix constraints.
+
+### Session Manager (`SessionManager`)
+
+Manages the lifecycle of hardware-bound identity tokens (cookies). It handles short-term cryptographic token synthesis, parsing, and revocation tracking using unique system transaction tags (`jti`).
+
+---
+
+## 3. Integration & Usage Examples
+
+### Initializing the Architecture
 
 ```go
-import "github.com/gddisney/secure_policy"
+import (
+    "github.com/0TrustCloud/secure_data_format"
+    "github.com/0TrustCloud/secure_policy"
+)
 
-// Initialize with your existing database
-policyEngine := secure_policy.NewPolicyEngine(db)
+// Instantiate the policy engine using your active SDF compiler instance
+policyEngine := secure_policy.NewPolicyEngine(sdfEngineInstance)
+
+// Instantiate the session manager with public-key verification capabilities
+sessionManager := secure_policy.NewSessionManager(sdfEngineInstance, rsaPublicKey)
 
 ```
 
-### 2. PBAC: Granting Permissions
-
-For high-frequency checks, grant explicit permissions that bypass complex attribute logic.
+### Managing Fine-Grained ABAC Policies
 
 ```go
-// Allow a specific subject (Ed25519 PubKey) to 'ingest' logs
-subject := []byte("...node-pubkey...")
-err := policyEngine.GrantPermission(subject, "ingest")
+subject := []byte("hardware-enclave-id-992")
+conditions := map[string]string{
+    "binary_path": "prefix:/usr/bin/",
+    "log_ext":     "suffix:.log",
+    "environment": "production",
+}
 
-```
+// Add a policy contract signed and registered via SDF
+err := policyEngine.AddPolicy(subject, "execute", "secure-vault", "ALLOW", conditions)
 
-### 3. ABAC: Evaluating Dynamic Policies
+// Evaluate incoming parameters at runtime
+context := map[string]string{
+    "binary_path": "/usr/bin/security_agent",
+    "log_ext":     "audit_trail.log",
+    "environment": "production",
+}
 
-For more complex scenarios, add policies that require specific context (e.g., only allow access from a specific IP).
-
-```go
-// Add a policy: Subject X can perform 'read' on 'logs_db' only if IP matches
-conditions := map[string]string{"ip": "10.0.0.5"}
-policyEngine.AddPolicy(subject, "read", "logs_db", "ALLOW", conditions)
-
-// Evaluate access at runtime
-context := map[string]string{"ip": "10.0.0.5"}
-if policyEngine.Evaluate(subject, "read", "logs_db", context) {
-    // Access granted
+if policyEngine.Evaluate(subject, "execute", "secure-vault", context) {
+    // Request authorized
 }
 
 ```
 
-## How It Works
-
-### The Authorization Flow
-
-When `Evaluate()` is called, the engine processes requests in a two-stage pipeline:
-
-1. **Fast-Path (PBAC)**: Checks the `perm:` key prefix in `ultimate_db`. If an explicit permission exists, it returns `true` immediately.
-2. **Fallback (ABAC)**: If no explicit permission is found, it queries the `policy:` key prefix. It searches for specific matches, then falls back to action wildcards (`*`) and subject wildcards.
-3. **Conflict Resolution**: During evaluation, if any matching policy has an effect of `DENY`, the engine immediately returns `false`, overriding any existing `ALLOW` policies.
-
-### Storage Layout
-
-Policies are stored in `ultimate_db` using the following keys:
-
-* `perm:<hex_subject>:<permission>`
-* `policy:<hex_subject>:<action>:<resource>`
-
-## Integration with Middleware
-
-This engine is designed to be injected into your `Router` or `RPCManager`.
+### Issuing and Validating Identity Sessions
 
 ```go
-// Example Middleware implementation
-func AuthMiddleware(pe *secure_policy.PolicyEngine, action string) {
-    // ... extract user identity and context ...
-    if !pe.Evaluate(userKey, action, "resource_name", runtimeContext) {
-        // Reject request
-    }
+// Issue an encrypted, signed session token bound to a hardware identity
+tokenStr, jti, err := sessionManager.IssueCookieToken(subject, 1*time.Hour)
+
+// Validate incoming token string properties against real-time blacklists
+validatedSubject, err := sessionManager.ValidateCookieToken(tokenStr)
+if err != nil {
+    // Token is expired, signature is corrupted, or identity has been blacklisted
 }
 
 ```
+
+### Executing Global Kill Switches
+
+```go
+// Invalidate a single cryptographic session instantly across memory and ledger logs
+err := sessionManager.RevokeSession(activeJTI, 24*time.Hour)
+
+// Permanently blacklist a compromised hardware device identity globally across the mesh
+err := sessionManager.RevokeDevice(subject)
+
+```
+
+---
+
+## 4. Under the Hood: The Evaluation Flow
+
+When an application calls `Evaluate()` or `ValidateCookieToken()`, the engine coordinates across the architecture using a lock-free fast-path execution loop:
+
+1. **Identity Extraction:** Parses the token to extract the structural payload metadata blocks safely.
+2. **Postures Check (POP Profiles):** Queries the memory ring for global hardware blocklists matching the subject's hash signature.
+3. **Session Check (GRANT Profiles):** Scans for session-specific revocation states matching the token's unique ID (`jti`).
+4. **Hierarchical Scan:** If the identity is clear, it crawls the key matrix (exact targets $\rightarrow$ action wildcards $\rightarrow$ global wildcards) to resolve policy effects under strict Deny-Override parameters.
+
+---
+
+## 5. Security & Verification Baseline
+
+| Operational Risk Vector | Enforcement Mechanism |
+| --- | --- |
+| **Token Hijacking & Replay** | Strict sequence tracking via cryptographic nonces (`getNextNonce`). |
+| **Silent Log/Policy Editing** | Deterministic `state_root_hash` validation prevents out-of-band tampering. |
+| **Identity/Session Revocation Lag** | Immediate validation eviction from the lock-free cache interrupts active sessions in microseconds. |
+| **Policy Ingestion Attacks** | Recursive AST depth controls inside the SDF layer prevent nesting execution panics. |
+
+---
+
+## 6. Testing the Environment
+
+The test suite runs entirely decoupled from disk I/O, utilizing in-memory mock stores to test edge cases, policy pattern variations, and revocation boundaries.
+
+Run the test matrix locally via the Go toolchain:
+
+```bash
+go test -v ./...
+
+```
+
+---
 
 ## License
 
-MIT License.
+MIT

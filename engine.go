@@ -15,10 +15,10 @@ type Policy struct {
 }
 
 type PolicyEngine struct {
-	sdfEngine *securedataformat.SecureDataEngine
+	sdfEngine *secure_data_format.SecureDataEngine
 }
 
-func NewPolicyEngine(sdf *securedataformat.SecureDataEngine) *PolicyEngine {
+func NewPolicyEngine(sdf *secure_data_format.SecureDataEngine) *PolicyEngine {
 	return &PolicyEngine{sdfEngine: sdf}
 }
 
@@ -139,61 +139,29 @@ func (pe *PolicyEngine) Evaluate(subject []byte, action, resource string, contex
 	isAllowed := false
 
 	for _, addr := range potentialAddresses {
-		worldStateKey := "state:grant:" + addr
-		var stateData []byte
+		dataKey := "data:" + addr
+		var policyBytes []byte
 		var err error
 
-		if stateData, err = ultimate_db.GlobalCacheStore.Read(txID, worldStateKey); err != nil {
-			stateData, err = pe.sdfEngine.Store.Get(txn, []byte(worldStateKey))
-			if err != nil || len(stateData) == 0 {
+		if policyBytes, err = ultimate_db.GlobalCacheStore.Read(txID, dataKey); err != nil {
+			txnSub := pe.sdfEngine.Store.Begin()
+			policyBytes, err = pe.sdfEngine.Store.Get(txnSub, []byte(dataKey))
+			txnSub.Commit()
+			if err != nil || len(policyBytes) == 0 {
 				continue
 			}
 		}
 
-		var meta map[string]interface{}
-		if err := json.Unmarshal(stateData, &meta); err != nil {
+		var p Policy
+		if err := json.Unmarshal(policyBytes, &p); err != nil {
 			continue
 		}
 
-		nonceVal, _ := meta["nonce"].(float64)
-		ledgerKey := fmt.Sprintf("transaction_ledger:grant:%s:%d", addr, uint64(nonceVal))
-		
-		var ledgerData []byte
-		if ledgerData, err = ultimate_db.GlobalCacheStore.Read(txID, ledgerKey); err != nil {
-			ledgerData, err = pe.sdfEngine.Store.Get(txn, []byte(ledgerKey))
-			if err != nil || len(ledgerData) == 0 {
-				continue
+		if pe.checkConditions(p.Conditions, context) {
+			if p.Effect == "DENY" {
+				return false // Strict Deny-Override Short-Circuit
 			}
-		}
-
-		var ledger map[string]interface{}
-		if err := json.Unmarshal(ledgerData, &ledger); err != nil {
-			continue
-		}
-
-		stateUpdates, ok := ledger["state_updates"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		effect, _ := stateUpdates["effect"].(string)
-		rawConditions, ok := stateUpdates["conditions"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		conditions := make(map[string]string)
-		for k, v := range rawConditions {
-			if strVal, ok := v.(string); ok {
-				conditions[k] = strVal
-			}
-		}
-
-		if pe.checkConditions(conditions, context) {
-			if effect == "DENY" {
-				return false
-			}
-			if effect == "ALLOW" {
+			if p.Effect == "ALLOW" {
 				isAllowed = true
 			}
 		}
@@ -246,12 +214,12 @@ func (pe *PolicyEngine) RevokeSubject(subject []byte) error {
 	script := `blacklist:device(status("revoked"))`
 	nonce := getNextNonce(pe.sdfEngine, "pop", targetAddress)
 
-	tx := securedataformat.DataInvocation{
+	tx := secure_data_format.DataInvocation{
 		TargetAddress: targetAddress,
 		Caller:        "policy-admin-service",
 		Nonce:         nonce,
 		Method:        "REVOKE",
-		Profile:       securedataformat.ProfileProofOfPoss,
+		Profile:       secure_data_format.ProfileProofOfPoss,
 		Args:          map[string]interface{}{"status": "revoked"},
 	}
 
@@ -266,12 +234,12 @@ func (pe *PolicyEngine) RestoreSubject(subject []byte) error {
 	script := `blacklist:device(status("active"))`
 	nonce := getNextNonce(pe.sdfEngine, "pop", targetAddress)
 
-	tx := securedataformat.DataInvocation{
+	tx := secure_data_format.DataInvocation{
 		TargetAddress: targetAddress,
 		Caller:        "policy-admin-service",
 		Nonce:         nonce,
 		Method:        "RESTORE",
-		Profile:       securedataformat.ProfileProofOfPoss,
+		Profile:       secure_data_format.ProfileProofOfPoss,
 		Args:          map[string]interface{}{"status": "active"},
 	}
 
@@ -286,12 +254,12 @@ func (pe *PolicyEngine) GrantPermission(subject []byte, permission string) error
 	script := `perm:assignment(status("active"))`
 	nonce := getNextNonce(pe.sdfEngine, "grant", targetAddress)
 
-	tx := securedataformat.DataInvocation{
+	tx := secure_data_format.DataInvocation{
 		TargetAddress: targetAddress,
 		Caller:        "policy-admin-service",
 		Nonce:         nonce,
 		Method:        "GRANT",
-		Profile:       securedataformat.ProfileGrant,
+		Profile:       secure_data_format.ProfileGrant,
 		Args:          map[string]interface{}{"status": "granted"},
 	}
 
@@ -306,12 +274,12 @@ func (pe *PolicyEngine) AddPolicy(subject []byte, action, resource, effect strin
 	script := fmt.Sprintf(`policy:statement(effect("%s"))`, effect)
 	nonce := getNextNonce(pe.sdfEngine, "grant", targetAddress)
 
-	tx := securedataformat.DataInvocation{
+	tx := secure_data_format.DataInvocation{
 		TargetAddress: targetAddress,
 		Caller:        "policy-admin-service",
 		Nonce:         nonce,
 		Method:        "ADD",
-		Profile:       securedataformat.ProfileGrant,
+		Profile:       secure_data_format.ProfileGrant,
 		Args: map[string]interface{}{
 			"effect":     effect,
 			"conditions": conditions,
@@ -319,7 +287,15 @@ func (pe *PolicyEngine) AddPolicy(subject []byte, action, resource, effect strin
 	}
 
 	_, err := pe.sdfEngine.CompileSecureData(script, tx)
-	return err
+	if err != nil {
+		return err
+	}
+
+	policyBytes, _ := json.Marshal(Policy{Effect: effect, Conditions: conditions})
+	txn := pe.sdfEngine.Store.Begin()
+	_ = pe.sdfEngine.Store.Put(txn, []byte("data:"+targetAddress), policyBytes, 0)
+	_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(ultimate_db.GlobalCacheStore.BeginOCC(), map[string][]byte{"data:"+targetAddress: policyBytes}, 0)
+	return txn.Commit()
 }
 
 func (pe *PolicyEngine) RemovePolicy(subject []byte, action, resource string) error {
@@ -329,15 +305,22 @@ func (pe *PolicyEngine) RemovePolicy(subject []byte, action, resource string) er
 	script := `policy:statement(status("deleted"))`
 	nonce := getNextNonce(pe.sdfEngine, "grant", targetAddress)
 
-	tx := securedataformat.DataInvocation{
+	tx := secure_data_format.DataInvocation{
 		TargetAddress: targetAddress,
 		Caller:        "policy-admin-service",
 		Nonce:         nonce,
 		Method:        "REMOVE",
-		Profile:       securedataformat.ProfileGrant,
+		Profile:       secure_data_format.ProfileGrant,
 		Args:          map[string]interface{}{"effect": "DENY"},
 	}
 
 	_, err := pe.sdfEngine.CompileSecureData(script, tx)
-	return err
+	if err != nil {
+		return err
+	}
+
+	txn := pe.sdfEngine.Store.Begin()
+	_ = pe.sdfEngine.Store.Delete(txn, []byte("data:"+targetAddress))
+	_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(ultimate_db.GlobalCacheStore.BeginOCC(), map[string][]byte{"data:"+targetAddress: nil}, 0)
+	return txn.Commit()
 }

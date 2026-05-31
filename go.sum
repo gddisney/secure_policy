@@ -1,2 +1,6 @@
+github.com/0TrustCloud/secure_data_format v0.0.0-20260531000326-0309f369a4e0 h1:uf0hvm5UG+NkXlP0no83vgwhXVk/TU847ZxdffRgsfs=
+github.com/0TrustCloud/secure_data_format v0.0.0-20260531000326-0309f369a4e0/go.mod h1:+n1NxZgNu3E8s5wDl20fO0StPNslAzi9LUKPO7xLRLw=
 github.com/0TrustCloud/ultimate_db v1.2.2 h1:jtIGBpMUlho3e/nPT/r5n2HLWcqDqtAu9BSEIax+7JY=
 github.com/0TrustCloud/ultimate_db v1.2.2/go.mod h1:zts/iJNVBJeAeIurLSuN+RYLS1Rc5d1qWRV0g8YD420=
+github.com/golang-jwt/jwt/v5 v5.3.1 h1:kYf81DTWFe7t+1VvL7eS+jKFVWaUnK9cB1qbwn63YCY=
+github.com/golang-jwt/jwt/v5 v5.3.1/go.mod h1:fxCRLWMO43lRc8nhHWY6LGqRcf+1gQWArsqaEUEa5bE=

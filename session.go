@@ -14,11 +14,11 @@ import (
 )
 
 type SessionManager struct {
-	sdfEngine *securedataformat.SecureDataEngine
+	sdfEngine *secure_data_format.SecureDataEngine
 	publicKey *rsa.PublicKey
 }
 
-func NewSessionManager(sdf *securedataformat.SecureDataEngine, pubKey *rsa.PublicKey) *SessionManager {
+func NewSessionManager(sdf *secure_data_format.SecureDataEngine, pubKey *rsa.PublicKey) *SessionManager {
 	return &SessionManager{
 		sdfEngine: sdf,
 		publicKey: pubKey,
@@ -29,7 +29,6 @@ func NewSessionManager(sdf *securedataformat.SecureDataEngine, pubKey *rsa.Publi
 // Token Generation & Synthesis Path
 // =============================================================================
 
-// IssueCookieToken generates a polymorphic capability token bound to the hardware subject
 func (sm *SessionManager) IssueCookieToken(subject []byte, ttl time.Duration) (string, string, error) {
 	subjectID := string(subject)
 	targetAddress := "session:user:" + hashSubject(subject)
@@ -37,12 +36,12 @@ func (sm *SessionManager) IssueCookieToken(subject []byte, ttl time.Duration) (s
 	script := fmt.Sprintf(`session:identity(user("%s"))`, subjectID)
 	nonce := getNextNonce(sm.sdfEngine, "grant", targetAddress)
 
-	tx := securedataformat.DataInvocation{
+	tx := secure_data_format.DataInvocation{
 		TargetAddress: targetAddress,
 		Caller:        "session-manager-core",
 		Nonce:         nonce,
 		Method:        "ISSUE",
-		Profile:       securedataformat.ProfileGrant,
+		Profile:       secure_data_format.ProfileGrant,
 		Args:          map[string]interface{}{"sub": subjectID},
 	}
 
@@ -67,7 +66,6 @@ func (sm *SessionManager) IssueCookieToken(subject []byte, ttl time.Duration) (s
 // Validation & Verification Infrastructure
 // =============================================================================
 
-// ValidateCookieToken checks signature, expiration, and dual-tier cache/ledger blacklists
 func (sm *SessionManager) ValidateCookieToken(tokenString string) (string, error) {
 	tokenString = strings.TrimPrefix(tokenString, "user_session_")
 
@@ -91,7 +89,12 @@ func (sm *SessionManager) ValidateCookieToken(tokenString string) (string, error
 		return "", errors.New("invalid token claims")
 	}
 
-	subjectID, _ := claims["sub"].(string)
+	stateUpdates, ok := claims["state_updates"].(map[string]interface{})
+	if !ok {
+		return "", errors.New("missing structured payload context block")
+	}
+
+	subjectID, _ := stateUpdates["sub"].(string)
 	jti, _ := claims["jti"].(string)
 
 	txID := ultimate_db.GlobalCacheStore.BeginOCC()
@@ -194,7 +197,6 @@ func (sm *SessionManager) isSessionRevoked(txID uint64, txn ultimate_db.TxnHandl
 // Session Management / Revocation Mutation Interface
 // =============================================================================
 
-// RevokeTokenString parses an unverified token to extract the JTI and revokes it
 func (sm *SessionManager) RevokeTokenString(tokenString string) error {
 	tokenString = strings.TrimPrefix(tokenString, "user_session_")
 
@@ -212,18 +214,17 @@ func (sm *SessionManager) RevokeTokenString(tokenString string) error {
 	return errors.New("could not extract JTI from token payload")
 }
 
-// RevokeSession invalidates a specific JWT session token immediately
 func (sm *SessionManager) RevokeSession(jti string, expiry time.Duration) error {
 	targetAddress := "blacklist:jti:" + jti
 	script := `blacklist:session(status("revoked"))`
 	nonce := getNextNonce(sm.sdfEngine, "grant", targetAddress)
 
-	tx := securedataformat.DataInvocation{
+	tx := secure_data_format.DataInvocation{
 		TargetAddress: targetAddress,
 		Caller:        "session-admin-service",
 		Nonce:         nonce,
 		Method:        "REVOKE",
-		Profile:       securedataformat.ProfileGrant,
+		Profile:       secure_data_format.ProfileGrant,
 		Args:          map[string]interface{}{"status": "revoked"},
 	}
 
@@ -231,7 +232,6 @@ func (sm *SessionManager) RevokeSession(jti string, expiry time.Duration) error 
 	return err
 }
 
-// RevokeDevice permanently blacklists the hardware identity globally
 func (sm *SessionManager) RevokeDevice(subject []byte) error {
 	hashedSub := hashSubject(subject)
 	targetAddress := "blacklist:device:" + hashedSub
@@ -239,12 +239,12 @@ func (sm *SessionManager) RevokeDevice(subject []byte) error {
 	script := `blacklist:device(status("revoked"))`
 	nonce := getNextNonce(sm.sdfEngine, "pop", targetAddress)
 
-	tx := securedataformat.DataInvocation{
+	tx := secure_data_format.DataInvocation{
 		TargetAddress: targetAddress,
 		Caller:        "session-admin-service",
 		Nonce:         nonce,
 		Method:        "REVOKE",
-		Profile:       securedataformat.ProfileProofOfPoss,
+		Profile:       secure_data_format.ProfileProofOfPoss,
 		Args:          map[string]interface{}{"status": "revoked"},
 	}
 
